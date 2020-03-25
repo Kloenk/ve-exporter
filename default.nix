@@ -19,7 +19,7 @@ rustPlatform.buildRustPackage rec {
   version = "0.1.0";
   src = ./.;
   cargoSha256 = "18w33i3bb75xzrrlkq3jxy5cgvyc3kdq82iyv06af9k92mdxljc1";
-  buildInputs = [ libudev pkgconfig ];
+  #nativBuildInputs = [ libudev pkgconfig ];
   CARGO_HOME = "$(mktemp -d nix-cargo-home.XXX)";
   
 }

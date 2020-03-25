@@ -11,7 +11,8 @@ use std::io::{Read, BufReader, BufRead};
 use std::ops::Index;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_serial::{Serial, SerialPortSettings};
+use futures::{SinkExt, StreamExt};
+use serde_json::Value;
 
 //#[macro_use]
 //extern crate bitflags;
@@ -50,17 +51,22 @@ impl Config {
         actix_rt::spawn(async move {
             let data = data_w;
 
-            let mut settings = SerialPortSettings::default();
-            settings.baud_rate = baud_rate;
-            settings.timeout = timeout;
-
-            // TODO: init serial port
-            let mut port = Serial::from_path(path, &settings).unwrap(); // FIXME: unwrap?
+            let client = reqwest::ClientBuilder::new()
+                .timeout(timeout)
+                .user_agent(format!("ve/monitoring ({})", env!("CARGO_PKG_VERSION")))
+                .use_rustls_tls()
+                .build()
+                .unwrap();
 
             loop {
                 info!("run scraper");
 
-                data.update_cache(timeout, &mut port).await;
+                let mut rCache = data.cache.write().unwrap();
+                *rCache = match Cache::update_cache(&path, &client).await {
+                    Ok(v) => v,
+                    Err(e) => { trace!("error updating: {:?}", e); CacheData::offline() },
+                };
+                drop(rCache);
 
 
                 // TODO: Remove
@@ -113,9 +119,8 @@ async fn metric(
 ) -> HttpResponse {
     let cache = cache.cache.read().unwrap();
 
-    let data = json!({
-      "up": if cache.online { "1" } else { "0" }
-    });
+    let data = cache.clone();
+    //let data = json!{"cache": data};
 
     let body = hb.render("metric", &data).unwrap();
     /*let ret = format!(
@@ -187,71 +192,40 @@ impl Cache {
     }
 
     #[cfg(not(feature = "redis"))]
-    async fn update_cache(&self, timeout: std::time::Duration, serial: &mut Serial) {
-        let mut reader = BufReader::new(serial);
+    async fn update_cache(address: &str, client: &reqwest::Client) -> Result<CacheData, Box<dyn std::error::Error>> {
+        let resp = client
+            .get(address)
+            .send()
+            .await?;
+
+        let resp = resp.text().await?;
+        let resp: Value = serde_json::from_str(&resp)?;
 
         let mut cachData = CacheData::offline();
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let val: &str = &line[(line.find("\t").unwrap_or(0))..];
-                let val = val.trim();
-                if line.starts_with("PID") {
-                   cachData.pid = parse_pid(val);
-                } else if line.starts_with("IL") {
-                    cachData.loadCurrent = val.parse().unwrap_or(0);
-                } else if line.starts_with("LOAD") {
-                    if val == "ON" {
-                        cachData.load = true;
-                    } else if val == "OFF" {
-                        cachData.load = false;
-                    }
-                } else if line.starts_with("T") {
-                    cachData.temp = val.parse().unwrap_or(0);
-                } else if line.starts_with("P") {
-                    cachData.power = val.parse().unwrap_or(0);
-                } else if line.starts_with("CE") {
-                    cachData.consumedAmpHours = val.parse().unwrap_or(0);
-                } else if line.starts_with("SOC") {
-                    cachData.stateOfCharge = val.parse().unwrap_or(0);
-                } else if line.starts_with("TTG") {
-                    cachData.timeToGo = val.parse().unwrap_or(0);
-                } else if line.starts_with("Alarm") {
-                    warn!("ALARM not implemented");
-                    //cachData.alarm = true; // FIXME implement
-                } else if line.starts_with("Relay") {
-                    warn!("RELAY not implemented");
-                    //cachData.relay = true;
-                } else if line.starts_with("AR") {
-                    cachData.alarmReason = val.to_string();
-                } else if line.starts_with("OR") {
-                    cachData.offReason = val.to_string();
-                } else if line.starts_with("H1") {
-                    cachData.depthOfDischarge = val.parse().unwrap_or(0);
-                } else if line.starts_with("H2") {
-                    cachData.lastDischargeDepth = val.parse().unwrap_or(0);
-                } else if line.starts_with("H3") {
-                    cachData.avgDischargeDepth = val.parse().unwrap_or(0);
-                } else if line.starts_with("H4") {
-                    cachData.chargeCycles = val.parse().unwrap_or(0);
-                } else if line.starts_with("H5") {
-                    cachData.discharges = val.parse().unwrap_or(0);
-                } else if line.starts_with("H6") {
-                    cachData.cumulativeDrawn = val.parse().unwrap_or(0);
-                } else if line.starts_with("H7") {
-                    cachData.minVoltage = val.parse().unwrap_or(0);
-                } else if line.starts_with("H8") {
-                    cachData.maxVoltage = val.parse().unwrap_or(0);
-                } // TODO: ...
-            }
-        }
-
-
-
-
-
-
-        let mut cache = self.cache.write().unwrap();
-        *cache = cachData;
+        cachData.online = true;
+        trace!("resp: {:?}", resp);
+        cachData.voltageCurrent = resp.get("V").map(|v| v.as_str().map(|v| v.parse().ok())).flatten().flatten().unwrap_or(0);
+        cachData.serialNumber = resp.get("SER#").map(|v| v.as_str()).flatten().unwrap_or("").to_string();
+        cachData.state = resp.get("CS").map(|v| v.as_str().map(|v| v.parse::<u8>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.current = resp.get("I").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.yieldTotalUser = resp.get("H19").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.day = resp.get("HSDS").map(|v| v.as_str().map(|v| v.parse::<u16>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.yieldTotal = resp.get("H20").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.maxPowerYesterday = resp.get("H23").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.load = resp.get("LOAD").map(|v| v.as_str().map(|v| match v {
+            "ON" => true,
+            _ => false,
+        })).flatten().unwrap_or(false);
+        cachData.pannelPower = resp.get("PPV").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.loadCurrent = resp.get("IL").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.panelVoltage = resp.get("VPV").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.yieldYesterday = resp.get("H22").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.firmware16 = resp.get("FW").map(|v| v.as_str().map(|v| v.parse::<u16>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.maxPowerToday = resp.get("H21").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.offReason = resp.get("OR").map(|v| v.as_str()).flatten().unwrap_or("").to_string();
+        cachData.errCode = resp.get("ERR").map(|v| v.as_str()).flatten().unwrap_or("").to_string();
+        cachData.pid = resp.get("PID").map(|v| v.as_str().map(|v| parse_pid(v))).flatten().unwrap_or("".to_string());
+        Ok(cachData)
     }
 
     /*#[cfg(not(feature = "redis"))]
@@ -266,9 +240,25 @@ struct CacheData {
     online: bool,
     pid: String,
 
+    /// voltage current
+    /// Units: mV
+    voltageCurrent: isize,
+
     /// Load Current
     /// Units: mA
     loadCurrent: isize,
+
+    /// Main or channel 1 battery current
+    /// Units: mA
+    current: isize,
+
+    /// Panel voltage
+    /// Units: mV
+    panelVoltage: isize,
+
+    /// Panel Power
+    /// Units: W
+    pannelPower: isize,
 
     /// Load output state (ON/OFF)
     load: bool,
@@ -415,7 +405,11 @@ impl CacheData {
         Self {
             online: false,
             pid: "unknown".to_string(),
+            voltageCurrent: 0,
             loadCurrent: 0,
+            current: 0,
+            panelVoltage: 0,
+            pannelPower: 0,
             load: false,
             temp: 0,
             power: 0,
@@ -457,6 +451,6 @@ fn parse_pid(pid: &str) -> String {
         "0x203" => "BMV-700",
         "0x204" => "BMV-702",
 
-        _ => "Unknown"
+        _ => { warn!("Unknown pid: {}", pid); "Unknown" },
     }.to_string()
 }
