@@ -16,10 +16,10 @@ let
 in
 rustPlatform.buildRustPackage rec {
   name = "ve-exporter-${version}";
-  version = "0.1.0";
+  version = "0.1.1";
   src = ./.;
-  cargoSha256 = "18w33i3bb75xzrrlkq3jxy5cgvyc3kdq82iyv06af9k92mdxljc1";
-  buildInputs = [ libudev pkgconfig ];
+  cargoSha256 = "0f99rdjj2yd8gal7ylzpzv0ay40rv9zm3czlrgpzj5blk1yax0rc";
+  #nativBuildInputs = [ libudev pkgconfig ];
   CARGO_HOME = "$(mktemp -d nix-cargo-home.XXX)";
   
 }

@@ -11,7 +11,8 @@ use std::io::{Read, BufReader, BufRead};
 use std::ops::Index;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_serial::{Serial, SerialPortSettings};
+use futures::{SinkExt, StreamExt};
+use serde_json::Value;
 
 //#[macro_use]
 //extern crate bitflags;
@@ -50,17 +51,22 @@ impl Config {
         actix_rt::spawn(async move {
             let data = data_w;
 
-            let mut settings = SerialPortSettings::default();
-            settings.baud_rate = baud_rate;
-            settings.timeout = timeout;
-
-            // TODO: init serial port
-            let mut port = Serial::from_path(path, &settings).unwrap(); // FIXME: unwrap?
+            let client = reqwest::ClientBuilder::new()
+                .timeout(timeout)
+                .user_agent(format!("ve/monitoring ({})", env!("CARGO_PKG_VERSION")))
+                .use_rustls_tls()
+                .build()
+                .unwrap();
 
             loop {
                 info!("run scraper");
 
-                data.update_cache(timeout, &mut port).await;
+                let mut rCache = data.cache.write().unwrap();
+                *rCache = match Cache::update_cache(&path, &client).await {
+                    Ok(v) => v,
+                    Err(e) => { trace!("error updating: {:?}", e); CacheData::offline() },
+                };
+                drop(rCache);
 
 
                 // TODO: Remove
@@ -113,9 +119,8 @@ async fn metric(
 ) -> HttpResponse {
     let cache = cache.cache.read().unwrap();
 
-    let data = json!({
-      "up": if cache.online { "1" } else { "0" }
-    });
+    let data = cache.clone();
+    //let data = json!{"cache": data};
 
     let body = hb.render("metric", &data).unwrap();
     /*let ret = format!(
@@ -187,71 +192,40 @@ impl Cache {
     }
 
     #[cfg(not(feature = "redis"))]
-    async fn update_cache(&self, timeout: std::time::Duration, serial: &mut Serial) {
-        let mut reader = BufReader::new(serial);
+    async fn update_cache(address: &str, client: &reqwest::Client) -> Result<CacheData, Box<dyn std::error::Error>> {
+        let resp = client
+            .get(address)
+            .send()
+            .await?;
+
+        let resp = resp.text().await?;
+        let resp: Value = serde_json::from_str(&resp)?;
 
         let mut cachData = CacheData::offline();
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                let val: &str = &line[(line.find("\t").unwrap_or(0))..];
-                let val = val.trim();
-                if line.starts_with("PID") {
-                   cachData.pid = parse_pid(val);
-                } else if line.starts_with("IL") {
-                    cachData.loadCurrent = val.parse().unwrap_or(0);
-                } else if line.starts_with("LOAD") {
-                    if val == "ON" {
-                        cachData.load = true;
-                    } else if val == "OFF" {
-                        cachData.load = false;
-                    }
-                } else if line.starts_with("T") {
-                    cachData.temp = val.parse().unwrap_or(0);
-                } else if line.starts_with("P") {
-                    cachData.power = val.parse().unwrap_or(0);
-                } else if line.starts_with("CE") {
-                    cachData.consumedAmpHours = val.parse().unwrap_or(0);
-                } else if line.starts_with("SOC") {
-                    cachData.stateOfCharge = val.parse().unwrap_or(0);
-                } else if line.starts_with("TTG") {
-                    cachData.timeToGo = val.parse().unwrap_or(0);
-                } else if line.starts_with("Alarm") {
-                    warn!("ALARM not implemented");
-                    //cachData.alarm = true; // FIXME implement
-                } else if line.starts_with("Relay") {
-                    warn!("RELAY not implemented");
-                    //cachData.relay = true;
-                } else if line.starts_with("AR") {
-                    cachData.alarmReason = val.to_string();
-                } else if line.starts_with("OR") {
-                    cachData.offReason = val.to_string();
-                } else if line.starts_with("H1") {
-                    cachData.depthOfDischarge = val.parse().unwrap_or(0);
-                } else if line.starts_with("H2") {
-                    cachData.lastDischargeDepth = val.parse().unwrap_or(0);
-                } else if line.starts_with("H3") {
-                    cachData.avgDischargeDepth = val.parse().unwrap_or(0);
-                } else if line.starts_with("H4") {
-                    cachData.chargeCycles = val.parse().unwrap_or(0);
-                } else if line.starts_with("H5") {
-                    cachData.discharges = val.parse().unwrap_or(0);
-                } else if line.starts_with("H6") {
-                    cachData.cumulativeDrawn = val.parse().unwrap_or(0);
-                } else if line.starts_with("H7") {
-                    cachData.minVoltage = val.parse().unwrap_or(0);
-                } else if line.starts_with("H8") {
-                    cachData.maxVoltage = val.parse().unwrap_or(0);
-                } // TODO: ...
-            }
-        }
-
-
-
-
-
-
-        let mut cache = self.cache.write().unwrap();
-        *cache = cachData;
+        cachData.online = true;
+        trace!("resp: {:?}", resp);
+        cachData.voltageCurrent = resp.get("V").map(|v| v.as_str().map(|v| v.parse().ok())).flatten().flatten().unwrap_or(0);
+        cachData.serialNumber = resp.get("SER#").map(|v| v.as_str()).flatten().unwrap_or("").to_string();
+        cachData.state = resp.get("CS").map(|v| v.as_str().map(|v| v.parse::<u8>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.current = resp.get("I").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.yieldTotalUser = resp.get("H19").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.day = resp.get("HSDS").map(|v| v.as_str().map(|v| v.parse::<u16>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.yieldTotal = resp.get("H20").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.maxPowerYesterday = resp.get("H23").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.load = resp.get("LOAD").map(|v| v.as_str().map(|v| match v {
+            "ON" => true,
+            _ => false,
+        })).flatten().unwrap_or(false);
+        cachData.pannelPower = resp.get("PPV").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.loadCurrent = resp.get("IL").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.panelVoltage = resp.get("VPV").map(|v| v.as_str().map(|v| v.parse::<isize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.yieldYesterday = resp.get("H22").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.firmware16 = resp.get("FW").map(|v| v.as_str().map(|v| v.parse::<u16>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.maxPowerToday = resp.get("H21").map(|v| v.as_str().map(|v| v.parse::<usize>().ok())).flatten().flatten().unwrap_or(0);
+        cachData.offReason = resp.get("OR").map(|v| v.as_str()).flatten().unwrap_or("").to_string();
+        cachData.errCode = resp.get("ERR").map(|v| v.as_str()).flatten().unwrap_or("").to_string();
+        cachData.pid = resp.get("PID").map(|v| v.as_str().map(|v| parse_pid(v))).flatten().unwrap_or("".to_string());
+        Ok(cachData)
     }
 
     /*#[cfg(not(feature = "redis"))]
@@ -266,9 +240,25 @@ struct CacheData {
     online: bool,
     pid: String,
 
+    /// voltage current
+    /// Units: mV
+    voltageCurrent: isize,
+
     /// Load Current
     /// Units: mA
     loadCurrent: isize,
+
+    /// Main or channel 1 battery current
+    /// Units: mA
+    current: isize,
+
+    /// Panel voltage
+    /// Units: mV
+    panelVoltage: isize,
+
+    /// Panel Power
+    /// Units: W
+    pannelPower: isize,
 
     /// Load output state (ON/OFF)
     load: bool,
@@ -415,7 +405,11 @@ impl CacheData {
         Self {
             online: false,
             pid: "unknown".to_string(),
+            voltageCurrent: 0,
             loadCurrent: 0,
+            current: 0,
+            panelVoltage: 0,
+            pannelPower: 0,
             load: false,
             temp: 0,
             power: 0,
@@ -456,7 +450,111 @@ fn parse_pid(pid: &str) -> String {
     match pid {
         "0x203" => "BMV-700",
         "0x204" => "BMV-702",
-
-        _ => "Unknown"
+        "0x205" => "BMV-700H",
+        "0x0300" => "BlueSolar MPPT 70|15",
+        "0xA040" => "BlueSolar MPPT 75|50",
+        "0xA041" => "BlueSolar MPPT 150|35",
+        "0xA042" => "BlueSolar MPPT 75|15",
+        "0xA043" => "BlueSolar MPPT 100|15",
+        "0xA044" => "BlueSolar MPPT 100|30",
+        "0xA045" => "BlueSolar MPPT 100|50",
+        "0xA046" => "BlueSolar MPPT 150|70",
+        "0xA047" => "BlueSolar MPPT 150|100",
+        "0xA049" => "BlueSolar MPPT 100|50 rev2",
+        "0xA04A" => "BlueSolar MPPT 100|30 rev2",
+        "0xA04B" => "BlueSolar MPPT 150|35 rev2",
+        "0xA04C" => "BlueSolar MPPT 75|10",
+        "0xA04D" => "BlueSolar MPPT 150|45",
+        "0xA04E" => "BlueSolar MPPT 150|60",
+        "0xA04F" => "BlueSolar MPPT 150|85",
+        "0xA050" => "SmartSolar MPPT 250|100",
+        "0xA051" => "SmartSolar MPPT 150|100",
+        "0xA052" => "SmartSolar MPPT 150|85",
+        "0xA053" => "SmartSolar MPPT 75|15",
+        "0xA054" => "SmartSolar MPPT 75|10",
+        "0xA055" => "SmartSolar MPPT 100|15",
+        "0xA056" => "SmartSolar MPPT 100|30",
+        "0xA057" => "SmartSolar MPPT 100|50",
+        "0xA058" => "SmartSolar MPPT 150|35",
+        "0xA059" => "SmartSolar MPPT 150|100 rev2",
+        "0xA05A" => "SmartSolar MPPT 150|85 rev2",
+        "0xA05B" => "SmartSolar MPPT 250|70",
+        "0xA05C" => "SmartSolar MPPT 250|85",
+        "0xA05D" => "SmartSolar MPPT 250|60",
+        "0xA05E" => "SmartSolar MPPT 250|45",
+        "0xA05F" => "SmartSolar MPPT 100|20",
+        "0xA060" => "SmartSolar MPPT 100|20 48V",
+        "0xA061" => "SmartSolar MPPT 150|45",
+        "0xA062" => "SmartSolar MPPT 150|60",
+        "0xA063" => "SmartSolar MPPT 150|70",
+        "0xA064" => "SmartSolar MPPT 250|85 rev2",
+        "0xA065" => "SmartSolar MPPT 250|100 rev2",
+        "0xA102" => "SmartSolar MPPT VE.Can 150/70",
+        "0xA103" => "SmartSolar MPPT VE.Can 150/45",
+        "0xA104" => "SmartSolar MPPT VE.Can 150/60",
+        "0xA105" => "SmartSolar MPPT VE.Can 150/85",
+        "0xA106" => "SmartSolar MPPT VE.Can 150/100",
+        "0xA107" => "SmartSolar MPPT VE.Can 250/45",
+        "0xA108" => "SmartSolar MPPT VE.Can 250/60",
+        "0xA109" => "SmartSolar MPPT VE.Can 250/70",
+        "0xA10A" => "SmartSolar MPPT VE.Can 250/85",
+        "0xA10B" => "SmartSolar MPPT VE.Can 250/100",
+        "0xA201" => "Phoenix Inverter 12V 250VA 230V",
+        "0xA202" => "Phoenix Inverter 24V 250VA 230V",
+        "0xA204" => "Phoenix Inverter 48V 250VA 230V",
+        "0xA211" => "Phoenix Inverter 12V 375VA 230V",
+        "0xA212" => "Phoenix Inverter 24V 375VA 230V",
+        "0xA214" => "Phoenix Inverter 48V 375VA 230V",
+        "0xA221" => "Phoenix Inverter 12V 500VA 230V",
+        "0xA222" => "Phoenix Inverter 24V 500VA 230V",
+        "0xA224" => "Phoenix Inverter 48V 500VA 230V",
+        "0xA231" => "Phoenix Inverter 12V 250VA 230V",
+        "0xA232" => "Phoenix Inverter 24V 250VA 230V",
+        "0xA234" => "Phoenix Inverter 48V 250VA 230V",
+        "0xA239" => "Phoenix Inverter 12V 250VA 120V",
+        "0xA23A" => "Phoenix Inverter 24V 250VA 120V",
+        "0xA23C" => "Phoenix Inverter 48V 250VA 120V",
+        "0xA241" => "Phoenix Inverter 12V 375VA 230V",
+        "0xA242" => "Phoenix Inverter 24V 375VA 230V",
+        "0xA244" => "Phoenix Inverter 48V 375VA 230V",
+        "0xA249" => "Phoenix Inverter 12V 375VA 120V",
+        "0xA24A" => "Phoenix Inverter 24V 375VA 120V",
+        "0xA24C" => "Phoenix Inverter 48V 375VA 120V",
+        "0xA251" => "Phoenix Inverter 12V 500VA 230V",
+        "0xA252" => "Phoenix Inverter 24V 500VA 230V",
+        "0xA254" => "Phoenix Inverter 48V 500VA 230V",
+        "0xA259" => "Phoenix Inverter 12V 500VA 120V",
+        "0xA25A" => "Phoenix Inverter 24V 500VA 120V",
+        "0xA25C" => "Phoenix Inverter 48V 500VA 120V",
+        "0xA261" => "Phoenix Inverter 12V 800VA 230V",
+        "0xA262" => "Phoenix Inverter 24V 800VA 230V",
+        "0xA264" => "Phoenix Inverter 48V 800VA 230V",
+        "0xA269" => "Phoenix Inverter 12V 800VA 120V",
+        "0xA26A" => "Phoenix Inverter 24V 800VA 120V",
+        "0xA26C" => "Phoenix Inverter 48V 800VA 120V",
+        "0xA271" => "Phoenix Inverter 12V 1200VA 230V",
+        "0xA272" => "Phoenix Inverter 24V 1200VA 230V",
+        "0xA274" => "Phoenix Inverter 48V 1200VA 230V",
+        "0xA279" => "Phoenix Inverter 12V 1200VA 120V",
+        "0xA27A" => "Phoenix Inverter 24V 1200VA 120V",
+        "0xA27C" => "Phoenix Inverter 48V 1200VA 120V",
+        "0xA281" => "Phoenix Inverter 12V 1600VA 230V",
+        "0xA282" => "Phoenix Inverter 24V 1600VA 230V",
+        "0xA284" => "Phoenix Inverter 48V 1600VA 230V",
+        "0xA291" => "Phoenix Inverter 12V 2000VA 230V",
+        "0xA292" => "Phoenix Inverter 24V 2000VA 230V",
+        "0xA294" => "Phoenix Inverter 48V 2000VA 230V",
+        "0xA2A1" => "Phoenix Inverter 12V 3000VA 230V",
+        "0xA2A2" => "Phoenix Inverter 24V 3000VA 230V",
+        "0xA2A4" => "Phoenix Inverter 48V 3000VA 230V",
+        "0xA340" => "Phoenix Smart IP43 Charger 12|50 (1+1)",
+        "0xA341" => "Phoenix Smart IP43 Charger 12|50 (3)",
+        "0xA342" => "Phoenix Smart IP43 Charger 24|25 (1+1)",
+        "0xA343" => "Phoenix Smart IP43 Charger 24|25 (3)",
+        "0xA344" => "Phoenix Smart IP43 Charger 12|30 (1+1)",
+        "0xA345" => "Phoenix Smart IP43 Charger 12|30 (3)",
+        "0xA346" => "Phoenix Smart IP43 Charger 24|16 (1+1)",
+        "0xA347" => "Phoenix Smart IP43 Charger 24|16 (3)",
+        _ => { warn!("Unknown pid: {}", pid); "Unknown" },
     }.to_string()
 }
