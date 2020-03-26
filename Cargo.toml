@@ -1,6 +1,6 @@
 [package]
 name = "ve_exporter"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Finn Behrens <me@kloenk.de>"]
 edition = "2018"
 
