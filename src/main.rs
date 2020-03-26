@@ -54,8 +54,8 @@ async fn main() -> std::io::Result<()> {
         )
         .arg(
             Arg::with_name("device")
-                .long("serial")
-                .short("serial")
+                .long("url")
+                .short("u")
                 .value_name("DEVICE")
                 .help("address of the serial2tcp")
                 .takes_value(true)

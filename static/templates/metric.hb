@@ -12,6 +12,6 @@ ve_power_panel{model="{{pid}}",serial="{{serialNumber}}"} {{pannelPower}}
 ve_current_load{model="{{pid}}",serial="{{serialNumber}}"} {{loadCurrent}}
 ve_voltage_panel{model="{{pid}}",serial="{{serialNumber}}"} {{panelVoltage}}
 ve_yield{model="{{pid}}",serial="{{serialNumber}}",day="yesterday"} {{yieldYesterday}}
-ve_firmware{model="{{pid}}",serial="{{serialNumber}}",bit=16} {{firmware16}}
+ve_firmware{model="{{pid}}",serial="{{serialNumber}}",bit="16"} {{firmware16}}
 ve_power_max{model="{{pid}}",serial="{{serialNumber}}",day="today"} {{maxPowerToday}}
-ve_voltage{model="{{pid}}",serial="{{serialNumber}}",day="yesterday"} {{voltageCurrent}}
+ve_voltage{model="{{pid}}",serial="{{serialNumber}}"} {{voltageCurrent}}
